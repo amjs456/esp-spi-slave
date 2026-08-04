@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_common.h"
 #include "driver/spi_slave.h"
 #include "driver/uart.h"
@@ -10,8 +11,10 @@
 #include "esp_heap_caps.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
+#include "hal/gpio_types.h"
 #include "hal/spi_types.h"
 #include "hal/uart_types.h"
+#include "soc/gpio_num.h"
 
 #define MISO_IO_NUM 13
 #define MOSI_IO_NUM 12
@@ -59,6 +62,17 @@ void app_main(void)
     
     char input_buf[64];
 
+    const gpio_config_t gpio_conf = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_2),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&gpio_conf);
+    gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_2, 1);
+
     while(1){
         if(fgets(input_buf, sizeof(input_buf), stdin) == NULL){
             clearerr(stdin);
@@ -66,6 +80,7 @@ void app_main(void)
         }
         input_buf[strcspn(input_buf, "\r\n")] = '\0';
         memcpy(tx_buf, input_buf, sizeof(input_buf));
+
         spi_slave_transaction_t transaction = {
             .flags = 0,
             .tx_buffer = tx_buf,
@@ -73,8 +88,10 @@ void app_main(void)
             .rx_buffer = rx_buf,
             .trans_len = 0,
         };
+        gpio_set_level(GPIO_NUM_2, 0);
         ESP_ERROR_CHECK(spi_slave_transmit(SPI2_HOST, &transaction, portMAX_DELAY));
         printf("%s\n", rx_buf);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        gpio_set_level(GPIO_NUM_2, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }    
 }
