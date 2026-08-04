@@ -4,11 +4,14 @@
 
 #include "driver/spi_common.h"
 #include "driver/spi_slave.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
 #include "hal/spi_types.h"
+#include "hal/uart_types.h"
 
 #define MISO_IO_NUM 13
 #define MOSI_IO_NUM 12
@@ -17,6 +20,18 @@
 
 void app_main(void)
 {
+    if(!uart_is_driver_installed(UART_NUM_0)){
+        ESP_ERROR_CHECK(uart_driver_install(
+            UART_NUM_0,
+            256,
+            0,
+            0,
+            NULL,
+            0));
+    }
+
+    uart_vfs_dev_use_driver(UART_NUM_0);
+
     const spi_bus_config_t bus_conf = {
         .mosi_io_num = MOSI_IO_NUM,
         .miso_io_num = MISO_IO_NUM,
@@ -35,19 +50,26 @@ void app_main(void)
     if(tx_buf == NULL) {
         return;
     }
-    char tx_data[8] = "Hello";
-    memcpy(tx_buf, tx_data, sizeof(tx_data));
+    
 
     uint8_t *rx_buf = spi_bus_dma_memory_alloc(SPI2_HOST, 8, 0);
     if(rx_buf == NULL) {
         return;
     }
     
+    char input_buf[64];
+
     while(1){
+        if(fgets(input_buf, sizeof(input_buf), stdin) == NULL){
+            clearerr(stdin);
+            continue;
+        }
+        input_buf[strcspn(input_buf, "\r\n")] = '\0';
+        memcpy(tx_buf, input_buf, sizeof(input_buf));
         spi_slave_transaction_t transaction = {
             .flags = 0,
             .tx_buffer = tx_buf,
-            .length = sizeof(tx_data) * 8,
+            .length = sizeof(input_buf) * 8,
             .rx_buffer = rx_buf,
             .trans_len = 0,
         };
