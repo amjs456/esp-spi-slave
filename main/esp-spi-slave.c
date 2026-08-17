@@ -36,9 +36,9 @@ static char *TAG = "ESP-SPI-SLAVE";
 #define MASTER_TO_SLAVE_IRQ_GPIO_NUM GPIO_NUM_4
 #define SLAVE_TO_MASTER_IRQ_GPIO_NUM GPIO_NUM_2
 
-QueueHandle_t input_buf_queue;
-BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-TaskHandle_t create_dummy_task_handle;
+static QueueHandle_t input_buf_queue;
+static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+static TaskHandle_t create_dummy_task_handle;
 static uint8_t irq_output_level = 1;
 
 DMA_ATTR static uint8_t tx_buf[QUEUE_SIZE][BUF_SIZE];
@@ -46,14 +46,14 @@ DMA_ATTR static uint8_t rx_buf[QUEUE_SIZE][BUF_SIZE];
 
 static spi_slave_transaction_t trans[QUEUE_SIZE];
 
-const spi_bus_config_t bus_conf = {
+static const spi_bus_config_t bus_conf = {
     .mosi_io_num = MOSI_IO_NUM,
     .miso_io_num = MISO_IO_NUM,
     .sclk_io_num = SCLK_IO_NUM,
     .quadwp_io_num = -1,
     .quadhd_io_num = -1,
 };
-const spi_slave_interface_config_t slave_if_conf = {
+static const spi_slave_interface_config_t slave_if_conf = {
     .spics_io_num = CS_IO_NUM,
     .queue_size = 1,
     .mode = 0,
