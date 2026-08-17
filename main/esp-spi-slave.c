@@ -1,28 +1,66 @@
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_common.h"
+#include "driver/spi_master.h"
 #include "driver/spi_slave.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_intr_alloc.h"
+#include "esp_log.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
 #include "hal/gpio_types.h"
 #include "hal/spi_types.h"
 #include "hal/uart_types.h"
+#include "portmacro.h"
 #include "soc/gpio_num.h"
+#include "freertos/queue.h"
+
+static char *TAG = "ESP-SPI-SLAVE";
 
 #define MISO_IO_NUM 13
 #define MOSI_IO_NUM 12
 #define SCLK_IO_NUM 14
 #define CS_IO_NUM 15
 
-void app_main(void)
-{
+#define QUEUE_SIZE 3
+#define BUF_SIZE 64
+
+#define MASTER_TO_SLAVE_IRQ_GPIO_NUM GPIO_NUM_4
+#define SLAVE_TO_MASTER_IRQ_GPIO_NUM GPIO_NUM_2
+
+QueueHandle_t input_buf_queue;
+BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+TaskHandle_t create_dummy_task_handle;
+static uint8_t irq_output_level = 1;
+
+DMA_ATTR static uint8_t tx_buf[QUEUE_SIZE][BUF_SIZE];
+DMA_ATTR static uint8_t rx_buf[QUEUE_SIZE][BUF_SIZE];
+
+static spi_slave_transaction_t trans[QUEUE_SIZE];
+
+const spi_bus_config_t bus_conf = {
+    .mosi_io_num = MOSI_IO_NUM,
+    .miso_io_num = MISO_IO_NUM,
+    .sclk_io_num = SCLK_IO_NUM,
+    .quadwp_io_num = -1,
+    .quadhd_io_num = -1,
+};
+const spi_slave_interface_config_t slave_if_conf = {
+    .spics_io_num = CS_IO_NUM,
+    .queue_size = 1,
+    .mode = 0,
+};
+
+
+static int uart_vfs_init() {
     if(!uart_is_driver_installed(UART_NUM_0)){
         ESP_ERROR_CHECK(uart_driver_install(
             UART_NUM_0,
@@ -35,63 +73,130 @@ void app_main(void)
 
     uart_vfs_dev_use_driver(UART_NUM_0);
 
-    const spi_bus_config_t bus_conf = {
-        .mosi_io_num = MOSI_IO_NUM,
-        .miso_io_num = MISO_IO_NUM,
-        .sclk_io_num = SCLK_IO_NUM,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-    };
-    const spi_slave_interface_config_t slave_if_conf = {
-        .spics_io_num = CS_IO_NUM,
-        .queue_size = 1,
-        .mode = 0,
-    };
-    ESP_ERROR_CHECK(spi_slave_initialize(SPI2_HOST, &bus_conf, &slave_if_conf, SPI_DMA_CH_AUTO));
+    return 0;
+}
 
-    uint8_t *tx_buf = spi_bus_dma_memory_alloc(SPI2_HOST, 8, 0);
-    if(tx_buf == NULL) {
-        return;
+static void IRAM_ATTR isr_handler(void *arg){
+    if(irq_output_level == 1){
+        xTaskNotifyFromISR(create_dummy_task_handle, 0, eNoAction, NULL);
     }
     
+}
 
-    uint8_t *rx_buf = spi_bus_dma_memory_alloc(SPI2_HOST, 8, 0);
-    if(rx_buf == NULL) {
-        return;
-    }
-    
-    char input_buf[64];
 
-    const gpio_config_t gpio_conf = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_2),
+static int irq_gpio_init(){
+    gpio_config_t gpio_master_to_slave_irq_conf = {
+        .pin_bit_mask = (1ULL << MASTER_TO_SLAVE_IRQ_GPIO_NUM),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE, 
+    };
+
+    gpio_config(&gpio_master_to_slave_irq_conf);
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    gpio_isr_handler_add(MASTER_TO_SLAVE_IRQ_GPIO_NUM, isr_handler, NULL);
+
+
+    const gpio_config_t gpio_slave_to_master_conf = {
+        .pin_bit_mask = (1ULL << SLAVE_TO_MASTER_IRQ_GPIO_NUM),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&gpio_conf);
-    gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_2, 1);
+    gpio_config(&gpio_slave_to_master_conf);
+    gpio_set_direction(SLAVE_TO_MASTER_IRQ_GPIO_NUM, GPIO_MODE_OUTPUT);
 
+    return 0;
+}
+
+static int dma_buf_init(){
+    for(int i = 0; i<QUEUE_SIZE; i++) {
+        memset(&trans[i], 0, sizeof(trans[i]));
+
+        trans[i].length = BUF_SIZE * 8;
+        trans[i].tx_buffer = tx_buf[i];
+        trans[i].rx_buffer = rx_buf[i];
+    }
+    return 0;
+}
+
+static void create_dummy_task(void *arg){
+    QueueHandle_t *input_buf_queue = (QueueHandle_t *)arg;
+    char dummy[64] = "\0";
+    while(1){
+        xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+        xQueueSendToBack(*input_buf_queue, dummy, portMAX_DELAY);
+    }
+    
+}
+
+static void stdin_read_task(void *arg) {
+    QueueHandle_t *input_buf_queue = (QueueHandle_t *)arg;
+
+    char input_buf[64];
+    
     while(1){
         if(fgets(input_buf, sizeof(input_buf), stdin) == NULL){
             clearerr(stdin);
             continue;
         }
         input_buf[strcspn(input_buf, "\r\n")] = '\0';
-        memcpy(tx_buf, input_buf, sizeof(input_buf));
-
-        spi_slave_transaction_t transaction = {
-            .flags = 0,
-            .tx_buffer = tx_buf,
-            .length = sizeof(input_buf) * 8,
-            .rx_buffer = rx_buf,
-            .trans_len = 0,
-        };
-        gpio_set_level(GPIO_NUM_2, 0);
-        ESP_ERROR_CHECK(spi_slave_transmit(SPI2_HOST, &transaction, portMAX_DELAY));
-        printf("%s\n", rx_buf);
-        gpio_set_level(GPIO_NUM_2, 1);
+        xQueueSendToBack(*input_buf_queue, input_buf, portMAX_DELAY);
         vTaskDelay(pdMS_TO_TICKS(10));
-    }    
+    }
+}
+
+static void transaction_task(void *arg) {
+    QueueHandle_t *input_buf_queue = (QueueHandle_t *)arg;
+    BaseType_t result;
+    char data[64];
+    int trans_index = 0;
+    spi_slave_transaction_t *done;
+    gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+    while(1){
+        result = xQueueReceive(*input_buf_queue, &data, portMAX_DELAY);
+        if(result != pdPASS) {
+            ESP_LOGE(TAG, "xQueueReceive failed");
+            continue;
+        }
+        memcpy(tx_buf[trans_index], data, sizeof(data));
+        spi_slave_queue_trans(SPI2_HOST, &trans[trans_index], portMAX_DELAY);
+        trans_index = (trans_index + 1) % QUEUE_SIZE;
+        irq_output_level = 0;
+        gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+        spi_slave_get_trans_result(SPI2_HOST, &done, portMAX_DELAY);
+        irq_output_level = 1;
+        gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+        printf("%s\n", (char *)done->rx_buffer);
+    }
+}
+
+
+void app_main(void)
+{
+    if(uart_vfs_init() != 0){
+        ESP_LOGE(TAG, "uart_vfs_init failed");
+    }
+
+    if(irq_gpio_init() != 0){
+        ESP_LOGE(TAG, "irq_gpio_init failed");
+    }
+
+    if(dma_buf_init() != 0){
+        ESP_LOGE(TAG, "dam_buf_init failed");
+    }
+
+    ESP_ERROR_CHECK(spi_slave_initialize(SPI2_HOST, &bus_conf, &slave_if_conf, SPI_DMA_CH_AUTO));
+
+    input_buf_queue = xQueueCreate(10, 64);
+    if(input_buf_queue == NULL){
+        ESP_LOGE(TAG, "input_buf_queue creation failed");
+    }
+
+
+    xTaskCreate(stdin_read_task, "stdin_read_task", 4096, &input_buf_queue, 2, NULL);
+    xTaskCreate(transaction_task, "transaction_task", 4096, &input_buf_queue, 2, NULL);
+    xTaskCreate(create_dummy_task, "create_dummy_task", 4096, &input_buf_queue, 2, &create_dummy_task_handle);
 }
