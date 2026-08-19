@@ -25,36 +25,28 @@
 
 static char *TAG = "ESP-SPI-SLAVE";
 
-#define MISO_IO_NUM 13
-#define MOSI_IO_NUM 12
-#define SCLK_IO_NUM 14
-#define CS_IO_NUM 15
-
-#define QUEUE_SIZE 3
-#define BUF_SIZE 64
-
-#define MASTER_TO_SLAVE_IRQ_GPIO_NUM GPIO_NUM_4
-#define SLAVE_TO_MASTER_IRQ_GPIO_NUM GPIO_NUM_2
+#define CONFIG_QUEUE_SIZE 3
+#define CONFIG_BUF_SIZE 64
 
 static QueueHandle_t input_buf_queue;
 static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 static TaskHandle_t create_dummy_task_handle;
 static uint8_t irq_output_level = 1;
 
-DMA_ATTR static uint8_t tx_buf[QUEUE_SIZE][BUF_SIZE];
-DMA_ATTR static uint8_t rx_buf[QUEUE_SIZE][BUF_SIZE];
+DMA_ATTR static uint8_t tx_buf[CONFIG_QUEUE_SIZE][CONFIG_BUF_SIZE];
+DMA_ATTR static uint8_t rx_buf[CONFIG_QUEUE_SIZE][CONFIG_BUF_SIZE];
 
-static spi_slave_transaction_t trans[QUEUE_SIZE];
+static spi_slave_transaction_t trans[CONFIG_QUEUE_SIZE];
 
 static const spi_bus_config_t bus_conf = {
-    .mosi_io_num = MOSI_IO_NUM,
-    .miso_io_num = MISO_IO_NUM,
-    .sclk_io_num = SCLK_IO_NUM,
+    .mosi_io_num = CONFIG_SPI_MOSI_GPIO,
+    .miso_io_num = CONFIG_SPI_MISO_GPIO,
+    .sclk_io_num = CONFIG_SPI_SCLK_GPIO,
     .quadwp_io_num = -1,
     .quadhd_io_num = -1,
 };
 static const spi_slave_interface_config_t slave_if_conf = {
-    .spics_io_num = CS_IO_NUM,
+    .spics_io_num = CONFIG_SPI_CS_GPIO,
     .queue_size = 1,
     .mode = 0,
 };
@@ -86,7 +78,7 @@ static void IRAM_ATTR isr_handler(void *arg){
 
 static int irq_gpio_init(){
     gpio_config_t gpio_master_to_slave_irq_conf = {
-        .pin_bit_mask = (1ULL << MASTER_TO_SLAVE_IRQ_GPIO_NUM),
+        .pin_bit_mask = (1ULL << CONFIG_MASTER_TO_SLAVE_IRQ_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -95,27 +87,27 @@ static int irq_gpio_init(){
 
     gpio_config(&gpio_master_to_slave_irq_conf);
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    gpio_isr_handler_add(MASTER_TO_SLAVE_IRQ_GPIO_NUM, isr_handler, NULL);
+    gpio_isr_handler_add(CONFIG_MASTER_TO_SLAVE_IRQ_GPIO, isr_handler, NULL);
 
 
     const gpio_config_t gpio_slave_to_master_conf = {
-        .pin_bit_mask = (1ULL << SLAVE_TO_MASTER_IRQ_GPIO_NUM),
+        .pin_bit_mask = (1ULL << CONFIG_SLAVE_TO_MASTER_IRQ_GPIO),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&gpio_slave_to_master_conf);
-    gpio_set_direction(SLAVE_TO_MASTER_IRQ_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_direction(CONFIG_SLAVE_TO_MASTER_IRQ_GPIO, GPIO_MODE_OUTPUT);
 
     return 0;
 }
 
 static int dma_buf_init(){
-    for(int i = 0; i<QUEUE_SIZE; i++) {
+    for(int i = 0; i<CONFIG_QUEUE_SIZE; i++) {
         memset(&trans[i], 0, sizeof(trans[i]));
 
-        trans[i].length = BUF_SIZE * 8;
+        trans[i].length = CONFIG_BUF_SIZE * 8;
         trans[i].tx_buffer = tx_buf[i];
         trans[i].rx_buffer = rx_buf[i];
     }
@@ -154,7 +146,7 @@ static void transaction_task(void *arg) {
     char data[64];
     int trans_index = 0;
     spi_slave_transaction_t *done;
-    gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+    gpio_set_level(CONFIG_SLAVE_TO_MASTER_IRQ_GPIO, irq_output_level);
     while(1){
         result = xQueueReceive(*input_buf_queue, &data, portMAX_DELAY);
         if(result != pdPASS) {
@@ -163,12 +155,12 @@ static void transaction_task(void *arg) {
         }
         memcpy(tx_buf[trans_index], data, sizeof(data));
         spi_slave_queue_trans(SPI2_HOST, &trans[trans_index], portMAX_DELAY);
-        trans_index = (trans_index + 1) % QUEUE_SIZE;
+        trans_index = (trans_index + 1) % CONFIG_QUEUE_SIZE;
         irq_output_level = 0;
-        gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+        gpio_set_level(CONFIG_SLAVE_TO_MASTER_IRQ_GPIO, irq_output_level);
         spi_slave_get_trans_result(SPI2_HOST, &done, portMAX_DELAY);
         irq_output_level = 1;
-        gpio_set_level(SLAVE_TO_MASTER_IRQ_GPIO_NUM, irq_output_level);
+        gpio_set_level(CONFIG_SLAVE_TO_MASTER_IRQ_GPIO, irq_output_level);
         printf("%s\n", (char *)done->rx_buffer);
     }
 }
